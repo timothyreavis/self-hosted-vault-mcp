@@ -164,15 +164,19 @@ class Vault:
         finally:
             os.close(fd)
 
-    def _read_file(self, path: str, limit: int = READ_LIMIT):
+    def _read_file(self, path: str, limit: int = READ_LIMIT, *, window=None):
         with self._open_file(path) as (stream, info):
+            # A synchronizer may replace the inode after discovery's cheap stat.
+            if window is not None and not _in_window(info, window):
+                return None, info
             data = stream.read(limit + 1)
         if len(data) > limit:
             raise ValueError("file exceeds read limit")
         return data, info
 
-    def _read_bytes(self, path: str, limit: int = READ_LIMIT) -> bytes:
-        return self._read_file(path, limit)[0]
+    def _read_bytes(self, path: str, limit: int = READ_LIMIT, *, window=None) -> bytes | None:
+        """Return None only when the opened revision falls outside a supplied window."""
+        return self._read_file(path, limit, window=window)[0]
 
     def _file_info(self, path: str):
         with self._open_file(path) as (_, info):
@@ -336,7 +340,10 @@ class Vault:
                         items.append({"path": relative, "match": "filename"})
                     else:
                         try:
-                            lines = self._read_bytes(relative).decode("utf-8", errors="replace").splitlines()
+                            data = self._read_bytes(relative, window=window) if filtered else self._read_bytes(relative)
+                            if data is None:
+                                continue
+                            lines = data.decode("utf-8", errors="replace").splitlines()
                         except (OSError, ValueError):
                             skipped += 1
                             continue

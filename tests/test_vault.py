@@ -9,8 +9,9 @@ import tempfile
 import time
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from vault_mcp.auth import Principal
 from vault_mcp.vault import PrePublishError, Vault
@@ -347,7 +348,9 @@ class VaultFixture(unittest.TestCase):
             self.assertEqual(first["items"], [])
             self.assertEqual(first["scanned"], 1000)
             self.assertTrue(first["truncated"])
-            read.assert_called_once_with("Agents/hello.md")
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(read.call_args.args, ("Agents/hello.md",))
+            self.assertIsNotNone(read.call_args.kwargs["window"])
             later = self.vault.search_notes_page(self.reader, "target", cursor=first["next_cursor"],
                                                  modified_after="2025-12-31T17:00:00.000-07:00")
             self.assertEqual([item["path"] for item in later["items"]], ["Agents/note-1004.md"])
@@ -365,6 +368,40 @@ class VaultFixture(unittest.TestCase):
         first = self.vault.list_files_page(self.reader, modified_after=lower)
         later = self.vault.list_files_page(self.reader, cursor=first["next_cursor"], modified_after=lower)
         self.assertEqual(later["items"], ["Agents/note-1004.md"])
+
+    def test_atomic_replacement_outside_window_is_not_read_or_matched(self):
+        note = self.mirror / "Agents/hello.md"
+        bounds = {"modified_after": "2026-01-01T00:00:00Z", "modified_before": "2026-01-01T00:00:01Z"}
+        original_info, original_open = self.vault._file_info, self.vault._open_file
+        for replacement_time in (1, 1767225601):
+            with self.subTest(replacement_time=replacement_time):
+                note.write_text("in-window original")
+                os.utime(note, (1767225600, 1767225600))
+                opened = []
+                @contextmanager
+                def observe_open(path):
+                    with original_open(path) as (stream, info):
+                        observed = Mock(wraps=stream)
+                        opened.append(observed)
+                        yield observed, info
+                def replace_after_discovery(path):
+                    info = original_info(path)
+                    replacement = Path(self.tmp.name) / "replacement.md"
+                    replacement.write_text("out-of-window needle")
+                    os.utime(replacement, (replacement_time, replacement_time))
+                    os.replace(replacement, note)
+                    return info
+                with patch.object(self.vault, "_open_file", observe_open), \
+                     patch.object(self.vault, "_file_info", replace_after_discovery):
+                    page = self.vault.search_notes_page(self.reader, "needle", **bounds)
+                self.assertEqual(len(opened), 2)  # Discovery and the replacement's content descriptor.
+                for stream in opened:
+                    stream.read.assert_not_called()
+                self.assertEqual(page["items"], [])
+                self.assertEqual(page["scanned"], 1)
+                self.assertEqual(page["skipped"], 0)
+                self.assertFalse(page["truncated"])
+                self.assertIsNone(page["next_cursor"])
 
     def test_read_metadata_comes_from_content_descriptor(self):
         note = self.mirror / "Agents/hello.md"
