@@ -114,7 +114,6 @@ class Vault:
 
     def _read_bytes(self, path: str, limit: int = READ_LIMIT) -> bytes:
         parts = safe_parts(path)
-        self._allowed(parts)
         fd = self._directory(parts[:-1])
         try:
             file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
@@ -143,6 +142,7 @@ class Vault:
 
     def read(self, actor: Principal, path: str) -> dict:
         actor.require("read")
+        self._allowed(safe_parts(path))
         data = self._read_bytes(path)
         result = {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         try:
@@ -434,6 +434,7 @@ class Vault:
 
     def create_note(self, actor: Principal, path: str, content: str, request_id: str) -> dict:
         actor.require("agent_write")
+        self._allowed(write_parts(path))
         self._writable(path)
         write_parts(path)
         fingerprint = hashlib.sha256(f"create\0{path}\0{content}".encode()).hexdigest()
@@ -441,6 +442,7 @@ class Vault:
 
     def update_note(self, actor: Principal, path: str, content: str, expected_sha: str, request_id: str) -> dict:
         actor.require("agent_write")
+        self._allowed(write_parts(path))
         self._writable(path)
         write_parts(path)
         fingerprint = hashlib.sha256(f"update\0{path}\0{expected_sha}\0{content}".encode()).hexdigest()

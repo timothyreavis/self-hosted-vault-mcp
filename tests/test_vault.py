@@ -167,6 +167,31 @@ class VaultFixture(unittest.TestCase):
             unicode_denied.read(self.reader, "Agents/Cafe\u0301/x.md")
         self.assertNotIn("Agents/Cafe\u0301/x.md", unicode_denied.list_files_page(self.reader)["items"])
 
+    def test_generic_policy_survives_private_writable_override(self):
+        (self.mirror / "Agents" / "Private").mkdir()
+        (self.mirror / "Agents" / "Private" / "existing.md").write_text("fixed adapter body")
+
+        class PermissiveView(Vault):
+            def _writable(self, path):
+                pass
+
+        view = PermissiveView(self.mirror, Path(self.tmp.name) / "override-state",
+                              denied_paths=("Agents/Private",))
+        self.assertEqual(view._read_bytes("Agents/Private/existing.md"), b"fixed adapter body")
+        with self.assertRaises(PermissionError):
+            view.read(self.reader, "Agents/Private/existing.md")
+        for operation in ("create", "update"):
+            request = str(uuid.uuid4())
+            with self.subTest(operation=operation), self.assertRaises(PermissionError):
+                if operation == "create":
+                    view.create_note(self.writer, "Agents/Private/new.md", "body", request)
+                else:
+                    view.update_note(self.writer, "Agents/Private/existing.md", "edit", "0" * 64, request)
+            with sqlite3.connect(view.state / "operations.sqlite3") as db:
+                self.assertIsNone(db.execute("SELECT id FROM operations WHERE id=?", (request,)).fetchone())
+        self.assertFalse((self.mirror / "Agents/Private/new.md").exists())
+        self.assertEqual((self.mirror / "Agents/Private/existing.md").read_text(), "fixed adapter body")
+
     def test_pages_reach_late_matches_and_reject_wrong_cursor(self):
         for number in range(1105):
             (self.mirror / "Agents" / f"note-{number:04}.md").write_text("late target" if number == 1104 else "ordinary")

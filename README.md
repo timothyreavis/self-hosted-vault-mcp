@@ -35,6 +35,8 @@ Writes require `agent_write`, a portable `.md` path inside the write folder, con
 
 A successful save confirms local filesystem persistence. It does **not** confirm synchronization to another device. Use a separately managed synchronization solution if needed; this project bundles none. Standalone writes work as soon as valid storage and authentication are configured. An optional external-readiness guard is documented in AGENTS.md and fails closed whenever configured.
 
+Before trusting a connected deployment, check that the actual synchronizer ignores `.vault-*.tmp` staging files. With synthetic notes and owner permission, verify MCP save to another device and a reverse edit from that device back through MCP read/SHA. In the intended native client, verify OAuth login, initialize, tool listing, read, and a permitted synthetic create/update. These connected checks are separate from the local fixture suite.
+
 The mutex coordinates MCP writers sharing the state directory. It is not a distributed lock; external editors and synchronizers can race a hash check. Use one MCP instance and avoid concurrent external edits to agent-owned notes. Keep backups of the vault and private state together; the state ledger preserves retry history and contains stored operation receipts.
 
 Hidden paths, traversal, and symlinks are blocked. Visible files elsewhere in the vault can be read explicitly. This is one vault trust boundary, not a per-folder multi-user permission system. Notes are untrusted data; the owner's instructions govern permitted use.
