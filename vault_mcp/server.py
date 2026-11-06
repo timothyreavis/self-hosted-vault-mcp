@@ -21,7 +21,8 @@ def create_app(config: Config | None = None, verifier=None):
     # Authenticate configuration before opening any vault/state storage.
     verifier = verifier if verifier is not None else configured_verifier()
     config = config if config is not None else Config.from_env()
-    vault = Vault(config.root, config.state, config.ready, config.write_folder, config.instructions, config.context)
+    vault = Vault(config.root, config.state, config.ready, config.write_folder, config.instructions,
+                  config.context, config.denied_paths)
     mcp = FastMCP("Self-hosted Vault MCP", mask_error_details=True, instructions=(
         "Call bootstrap for live owner instructions and optional context. Missing files do not grant "
         "additional authority. Read only relevant paths; routine writes stay in the configured write folder."))
@@ -37,6 +38,11 @@ def create_app(config: Config | None = None, verifier=None):
         return _call(vault.list_files, prefix, limit)
 
     @mcp.tool
+    def list_files_page(prefix: str | None = None, limit: int = 100, cursor: str | None = None) -> dict:
+        """List with bounded continuation and explicit scan coverage; prefer this over list_files."""
+        return _call(vault.list_files_page, prefix, limit, cursor)
+
+    @mcp.tool
     def read_file(path: str) -> dict:
         """Read one visible file with SHA-256, bounded to 256 KiB."""
         return _call(vault.read, path)
@@ -45,6 +51,12 @@ def create_app(config: Config | None = None, verifier=None):
     def search_notes(query: str, prefix: str | None = None, limit: int = 20) -> list[dict]:
         """Search bounded Markdown content; default write folder, explicit empty prefix searches the vault."""
         return _call(vault.search, query, prefix, limit)
+
+    @mcp.tool
+    def search_notes_page(query: str, prefix: str | None = None, limit: int = 20,
+                          cursor: str | None = None) -> dict:
+        """Search with bounded continuation and explicit scan coverage; prefer this over search_notes."""
+        return _call(vault.search_notes_page, query, prefix, limit, cursor)
 
     @mcp.tool
     def create_note(path: str, content: str, request_id: str) -> dict:
