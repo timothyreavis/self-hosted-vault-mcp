@@ -369,6 +369,27 @@ class VaultFixture(unittest.TestCase):
         later = self.vault.list_files_page(self.reader, cursor=first["next_cursor"], modified_after=lower)
         self.assertEqual(later["items"], ["Agents/note-1004.md"])
 
+    def test_filtered_search_does_not_stat_or_read_non_markdown_attachments(self):
+        folder = self.mirror / "Attachments"
+        folder.mkdir()
+        (folder / "diagram.png").write_bytes(b"needle fixture attachment")
+        bounds = {"modified_after": "2000-01-01T00:00:00Z"}
+        with patch.object(self.vault, "_file_info", side_effect=PermissionError("fixture unreadable attachment")) as info, \
+             patch.object(self.vault, "_read_bytes", side_effect=AssertionError("attachment body read")) as read:
+            page = self.vault.search_notes_page(self.reader, "needle", "Attachments", **bounds)
+            self.assertEqual(page, {"items": [], "scanned": 1, "skipped": 0,
+                                    "truncated": False, "next_cursor": None})
+            self.assertEqual(self.vault.search(self.reader, "needle", "Attachments", **bounds), [])
+            info.assert_not_called()
+            read.assert_not_called()
+            # Filtered listing still checks attachment metadata and reports unreadability.
+            listed = self.vault.list_files_page(self.reader, "Attachments", **bounds)
+            self.assertEqual(listed["skipped"], 1)
+            self.assertEqual(listed["scanned"], 1)
+            self.assertEqual(listed["items"], [])
+            info.assert_called_once_with("Attachments/diagram.png")
+            read.assert_not_called()
+
     def test_atomic_replacement_outside_window_is_not_read_or_matched(self):
         note = self.mirror / "Agents/hello.md"
         bounds = {"modified_after": "2026-01-01T00:00:00Z", "modified_before": "2026-01-01T00:00:01Z"}

@@ -324,6 +324,8 @@ class Vault:
                 if isinstance(relative, tuple):
                     skipped += 1
                     continue
+                if operation == "search" and not relative.lower().endswith(".md"):
+                    continue
                 if filtered:
                     if relative.endswith("/"):
                         continue  # A directory mtime does not describe descendant edits.
