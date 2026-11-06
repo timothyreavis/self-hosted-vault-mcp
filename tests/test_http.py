@@ -1,6 +1,7 @@
 """Signed Access assertion -> real registered MCP tool -> fixture file readback."""
 import hashlib
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -177,3 +178,26 @@ class HTTPFixture(unittest.TestCase):
             self.assertNotIn("Agents/Private/secret.md", page["items"])
             self.assertEqual(self.data(self.call(client, "search_notes_page", {"query": "private marker"}))["items"], [])
             self.assertFalse((self.root / "Agents/Private/new.md").exists())
+
+    def test_time_filter_schema_and_actual_calls(self):
+        os.utime(self.root / "Agents/sample.md", (1767225600, 1767225600))
+        bounds = {"modified_after": "2026-01-01T00:00:00Z", "modified_before": "2026-01-01T00:00:01Z"}
+        with TestClient(self.app) as client:
+            listed = self.post(client, "tools/list", assertion=self.assertion()).json()["result"]["tools"]
+            for tool in listed:
+                if tool["name"] in {"list_files", "list_files_page", "search_notes", "search_notes_page"}:
+                    self.assertTrue({"modified_after", "modified_before"} <= tool["inputSchema"]["properties"].keys())
+                    self.assertFalse({"modified_after", "modified_before"} & set(tool["inputSchema"].get("required", [])))
+            for name in ("list_files", "list_files_page", "search_notes", "search_notes_page"):
+                args = {**bounds, **({"query": "fixture"} if name.startswith("search") else {})}
+                result = self.data(self.call(client, name, args))
+                items = result["items"] if name.endswith("_page") else result
+                self.assertEqual(items[0]["path"] if name.startswith("search") else items[0], "Agents/sample.md")
+                self.assertTrue(self.call(client, name, {**args, "modified_before": bounds["modified_after"]})["isError"])
+                invalid = self.call(client, name, {**args, "modified_after": "fixture private input"})
+                self.assertTrue(invalid["isError"])
+                self.assertEqual(invalid["content"], [{"type": "text", "text": "invalid modification timestamp; use timezone-aware RFC3339"}])
+                empty = self.data(self.call(client, name, {**args, "modified_after": "2026-01-01T00:00:00.000000001Z"}))
+                self.assertEqual(empty["items"] if name.endswith("_page") else empty, [])
+            self.assertEqual(self.data(self.call(client, "read_file", {"path": "Agents/sample.md"}))["modified_at"],
+                             "2026-01-01T00:00:00.000000000Z")

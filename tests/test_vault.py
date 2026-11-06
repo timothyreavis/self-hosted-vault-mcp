@@ -9,8 +9,9 @@ import tempfile
 import time
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from vault_mcp.auth import Principal
 from vault_mcp.vault import PrePublishError, Vault
@@ -265,6 +266,181 @@ class VaultFixture(unittest.TestCase):
         self.assertEqual(later["skipped"], 1)
         self.assertGreaterEqual(later["scanned"], 2)
         self.assertIsNone(later["next_cursor"])
+
+    def test_modification_window_edges_and_legacy_shapes(self):
+        lower = "2026-01-01T00:00:00Z"
+        upper = "2026-01-01T00:00:01Z"
+        epoch_ns = 1767225600 * 1_000_000_000
+        os.utime(self.mirror / "Agents/hello.md", (1767225700, 1767225700))
+        for name, instant in (("old.md", epoch_ns - 1), ("new.md", epoch_ns),
+                              ("edited.md", epoch_ns + 999_999_999), ("upper.md", epoch_ns + 1_000_000_000)):
+            note = self.mirror / "Agents" / name
+            note.write_text("marker")
+            os.utime(note, ns=(instant, instant))
+        args = {"modified_after": lower, "modified_before": upper}
+        expected = ["Agents/edited.md", "Agents/new.md"]
+        self.assertEqual(self.vault.list_files(self.reader, **args), expected)
+        self.assertEqual([item["path"] for item in self.vault.search(self.reader, "marker", **args)], expected)
+        self.assertEqual(self.vault.list_files(self.reader, modified_before=lower), ["Agents/old.md"])
+        self.assertIn("Agents/upper.md", self.vault.list_files(self.reader, modified_after=upper))
+        self.assertIn("Agents/old.md", self.vault.list_files(self.reader))
+        # No body reads for out-of-window files, including matching filenames.
+        with patch.object(self.vault, "_read_bytes", wraps=self.vault._read_bytes) as read:
+            page = self.vault.search_notes_page(self.reader, "old", **args)
+            self.assertEqual(page["items"], [])
+            self.assertEqual([call.args[0] for call in read.call_args_list], expected)
+        # A real edit moves an existing file into the window just like a new file.
+        old = self.mirror / "Agents/old.md"
+        old.write_text("edited marker")
+        os.utime(old, ns=(epoch_ns, epoch_ns))
+        self.assertIn("Agents/old.md", self.vault.list_files(self.reader, **args))
+
+    def test_invalid_modification_windows_are_static_and_shared(self):
+        for bound in ("", "2026-01-01", "2026-01-01T00:00:00", "2026-02-30T00:00:00Z",
+                      "2026-01-01T00:00:00+24:00", "2026-01-01T00:00:00+00:60", "private secret", 123):
+            for field in ("modified_after", "modified_before"):
+                for method, args in ((self.vault.list_files_page, ()), (self.vault.list_files, ()),
+                                     (self.vault.search_notes_page, ("hello",)), (self.vault.search, ("hello",))):
+                    with self.subTest(bound=bound, field=field, method=method.__name__):
+                        with self.assertRaisesRegex(ValueError, "^invalid modification timestamp; use timezone-aware RFC3339$"):
+                            method(self.reader, *args, **{field: bound})
+        for upper in ("2026-01-01T00:00:00Z", "2025-01-01T00:00:00Z"):
+            with self.assertRaisesRegex(ValueError, "^modified_after must be earlier than modified_before$"):
+                self.vault.list_files_page(self.reader, modified_after="2026-01-01T00:00:00Z", modified_before=upper)
+
+    def test_filtered_root_policy_and_unreadable_files(self):
+        (self.mirror / "root.md").write_text("marker")
+        (self.mirror / ".hidden.md").write_text("marker")
+        (self.mirror / "alias.md").symlink_to(self.mirror / "root.md")
+        args = {"modified_after": "2000-01-01T00:00:00Z"}
+        listed = self.vault.list_files(self.reader, "", **args)
+        self.assertEqual(listed, ["AGENTS.md", "Context.md", "root.md"])
+        self.assertIn("Agents/", self.vault.list_files(self.reader, ""))
+        self.assertIn("Reference/sample.md", [item["path"] for item in self.vault.search(self.reader, "marker", "", **args)])
+        denied = Vault(self.mirror, Path(self.tmp.name) / "filtered-policy", denied_paths=("Reference",))
+        with patch.object(denied, "_file_info", wraps=denied._file_info) as info:
+            self.assertNotIn("Reference/sample.md", denied.list_files(self.reader, **args))
+            denied.search_notes_page(self.reader, "marker", "", **args)
+            self.assertNotIn("Reference/sample.md", [call.args[0] for call in info.call_args_list])
+        with patch.object(self.vault, "_file_info", side_effect=PermissionError("fixture denial")):
+            page = self.vault.search_notes_page(self.reader, "hello", **args)
+            self.assertEqual(page["items"], [])
+            self.assertEqual(page["skipped"], 1)
+            self.assertFalse(page["truncated"])
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                self.vault.list_files(self.reader, **args)
+        with self.assertRaises(PermissionError):
+            denied.list_files_page(self.reader, "Reference", **args)
+        for prefix in (".hidden", "../Agents", "alias.md"):
+            with self.assertRaises((ValueError, OSError)):
+                self.vault.list_files_page(self.reader, prefix, **args)
+
+    def test_sparse_filtered_continuation_and_normalized_binding(self):
+        lower = "2026-01-01T00:00:00Z"
+        os.utime(self.mirror / "Agents/hello.md", (1767225600, 1767225600))
+        for number in range(1005):
+            note = self.mirror / "Agents" / f"note-{number:04}.md"
+            note.write_text("target")
+            instant = 1767225600 if number == 1004 else 1
+            os.utime(note, (instant, instant))
+        with patch.object(self.vault, "_read_bytes", wraps=self.vault._read_bytes) as read:
+            first = self.vault.search_notes_page(self.reader, "target", modified_after=lower)
+            self.assertEqual(first["items"], [])
+            self.assertEqual(first["scanned"], 1000)
+            self.assertTrue(first["truncated"])
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(read.call_args.args, ("Agents/hello.md",))
+            self.assertIsNotNone(read.call_args.kwargs["window"])
+            later = self.vault.search_notes_page(self.reader, "target", cursor=first["next_cursor"],
+                                                 modified_after="2025-12-31T17:00:00.000-07:00")
+            self.assertEqual([item["path"] for item in later["items"]], ["Agents/note-1004.md"])
+            self.assertIsNone(later["next_cursor"])
+        for changed in ({}, {"modified_after": "2026-01-01T00:00:01Z"},
+                        {"modified_after": lower, "modified_before": "2027-01-01T00:00:00Z"}):
+            with self.assertRaisesRegex(ValueError, "invalid cursor"):
+                self.vault.search_notes_page(self.reader, "target", cursor=first["next_cursor"], **changed)
+        with self.assertRaisesRegex(ValueError, "invalid cursor"):
+            self.vault.search_notes_page(self.reader, "changed", cursor=first["next_cursor"], modified_after=lower)
+        changed_policy = Vault(self.mirror, Path(self.tmp.name) / "cursor-policy", denied_paths=("Reference",))
+        with self.assertRaisesRegex(ValueError, "invalid cursor"):
+            changed_policy.search_notes_page(self.reader, "target", cursor=first["next_cursor"], modified_after=lower)
+        # Listing has the same sparse scan cap and continuation, with string items.
+        first = self.vault.list_files_page(self.reader, modified_after=lower)
+        later = self.vault.list_files_page(self.reader, cursor=first["next_cursor"], modified_after=lower)
+        self.assertEqual(later["items"], ["Agents/note-1004.md"])
+
+    def test_filtered_search_does_not_stat_or_read_non_markdown_attachments(self):
+        folder = self.mirror / "Attachments"
+        folder.mkdir()
+        (folder / "diagram.png").write_bytes(b"needle fixture attachment")
+        bounds = {"modified_after": "2000-01-01T00:00:00Z"}
+        with patch.object(self.vault, "_file_info", side_effect=PermissionError("fixture unreadable attachment")) as info, \
+             patch.object(self.vault, "_read_bytes", side_effect=AssertionError("attachment body read")) as read:
+            page = self.vault.search_notes_page(self.reader, "needle", "Attachments", **bounds)
+            self.assertEqual(page, {"items": [], "scanned": 1, "skipped": 0,
+                                    "truncated": False, "next_cursor": None})
+            self.assertEqual(self.vault.search(self.reader, "needle", "Attachments", **bounds), [])
+            info.assert_not_called()
+            read.assert_not_called()
+            # Filtered listing still checks attachment metadata and reports unreadability.
+            listed = self.vault.list_files_page(self.reader, "Attachments", **bounds)
+            self.assertEqual(listed["skipped"], 1)
+            self.assertEqual(listed["scanned"], 1)
+            self.assertEqual(listed["items"], [])
+            info.assert_called_once_with("Attachments/diagram.png")
+            read.assert_not_called()
+
+    def test_atomic_replacement_outside_window_is_not_read_or_matched(self):
+        note = self.mirror / "Agents/hello.md"
+        bounds = {"modified_after": "2026-01-01T00:00:00Z", "modified_before": "2026-01-01T00:00:01Z"}
+        original_info, original_open = self.vault._file_info, self.vault._open_file
+        for replacement_time in (1, 1767225601):
+            with self.subTest(replacement_time=replacement_time):
+                note.write_text("in-window original")
+                os.utime(note, (1767225600, 1767225600))
+                opened = []
+                @contextmanager
+                def observe_open(path):
+                    with original_open(path) as (stream, info):
+                        observed = Mock(wraps=stream)
+                        opened.append(observed)
+                        yield observed, info
+                def replace_after_discovery(path):
+                    info = original_info(path)
+                    replacement = Path(self.tmp.name) / "replacement.md"
+                    replacement.write_text("out-of-window needle")
+                    os.utime(replacement, (replacement_time, replacement_time))
+                    os.replace(replacement, note)
+                    return info
+                with patch.object(self.vault, "_open_file", observe_open), \
+                     patch.object(self.vault, "_file_info", replace_after_discovery):
+                    page = self.vault.search_notes_page(self.reader, "needle", **bounds)
+                self.assertEqual(len(opened), 2)  # Discovery and the replacement's content descriptor.
+                for stream in opened:
+                    stream.read.assert_not_called()
+                self.assertEqual(page["items"], [])
+                self.assertEqual(page["scanned"], 1)
+                self.assertEqual(page["skipped"], 0)
+                self.assertFalse(page["truncated"])
+                self.assertIsNone(page["next_cursor"])
+
+    def test_read_metadata_comes_from_content_descriptor(self):
+        note = self.mirror / "Agents/hello.md"
+        instant = 1767225600123456789
+        os.utime(note, ns=(instant, instant))
+        original_fdopen = os.fdopen
+        def replace_after_open(fd, *args, **kwargs):
+            replacement = self.mirror / "Agents/replacement.md"
+            replacement.write_text("other inode")
+            os.utime(replacement, (1, 1))
+            os.replace(replacement, note)
+            return original_fdopen(fd, *args, **kwargs)
+        with patch("vault_mcp.vault.os.fdopen", side_effect=replace_after_open):
+            result = self.vault.read(self.reader, "Agents/hello.md")
+        self.assertEqual(result["text"], "hello")
+        self.assertEqual(result["modified_at"], "2026-01-01T00:00:00.123456789Z")
+        self.assertEqual(result["sha256"], hashlib.sha256(b"hello").hexdigest())
+        self.assertEqual(note.read_text(), "other inode")
 
     def test_ready_gate(self):
         self.ready.write_text(json.dumps({"phase": "ready", "ok": True, "completed_at": time.time() - 1000,

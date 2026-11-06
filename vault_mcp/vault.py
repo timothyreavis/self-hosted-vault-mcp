@@ -11,6 +11,8 @@ import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 
 from .auth import Principal
@@ -22,6 +24,38 @@ READ_LIMIT = 256 * 1024
 NOTE_LIMIT = 64 * 1024
 SEARCH_LIMIT = 1000
 CURSOR_LIMIT = 4096
+
+
+def _modified_bound(value: str | None) -> Fraction | None:
+    """Parse aware RFC3339 without losing subsecond precision at window edges."""
+    if value is None:
+        return None
+    pattern = r"([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt]([0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})"
+    match = re.fullmatch(pattern, value) if isinstance(value, str) and len(value) <= 200 else None
+    if match is None:
+        raise ValueError("invalid modification timestamp; use timezone-aware RFC3339")
+    day, clock, fraction, offset = match.groups()
+    try:
+        if offset.lower() != "z" and (int(offset[1:3]) > 23 or int(offset[4:]) > 59):
+            raise ValueError
+        instant = datetime.fromisoformat(f"{day}T{clock}{'+00:00' if offset.lower() == 'z' else offset}")
+        delta = instant - datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return Fraction(delta.days * 86400 + delta.seconds) + Fraction(fraction or "0")
+    except (ValueError, OverflowError):
+        raise ValueError("invalid modification timestamp; use timezone-aware RFC3339") from None
+
+
+def _modified_window(after: str | None, before: str | None):
+    lower, upper = _modified_bound(after), _modified_bound(before)
+    if lower is not None and upper is not None and lower >= upper:
+        raise ValueError("modified_after must be earlier than modified_before")
+    return lower, upper
+
+
+def _in_window(info, window) -> bool:
+    lower, upper = window
+    modified = Fraction(info.st_mtime_ns, 1_000_000_000)
+    return (lower is None or modified >= lower) and (upper is None or modified < upper)
 
 
 class PrePublishError(RuntimeError):
@@ -115,20 +149,38 @@ class Vault:
             os.close(fd)
             raise
 
-    def _read_bytes(self, path: str, limit: int = READ_LIMIT) -> bytes:
+    @contextmanager
+    def _open_file(self, path: str):
+        """Pin the regular file for both content and metadata; never follow symlinks."""
         parts = safe_parts(path)
         fd = self._directory(parts[:-1])
         try:
             file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
             with os.fdopen(file_fd, "rb") as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode):
                     raise ValueError("not a regular file")
-                data = stream.read(limit + 1)
-            if len(data) > limit:
-                raise ValueError("file exceeds read limit")
-            return data
+                yield stream, info
         finally:
             os.close(fd)
+
+    def _read_file(self, path: str, limit: int = READ_LIMIT, *, window=None):
+        with self._open_file(path) as (stream, info):
+            # A synchronizer may replace the inode after discovery's cheap stat.
+            if window is not None and not _in_window(info, window):
+                return None, info
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("file exceeds read limit")
+        return data, info
+
+    def _read_bytes(self, path: str, limit: int = READ_LIMIT, *, window=None) -> bytes | None:
+        """Return None only when the opened revision falls outside a supplied window."""
+        return self._read_file(path, limit, window=window)[0]
+
+    def _file_info(self, path: str):
+        with self._open_file(path) as (_, info):
+            return info
 
     def _writable(self, path: str) -> None:
         parts = write_parts(path)
@@ -146,8 +198,11 @@ class Vault:
     def read(self, actor: Principal, path: str) -> dict:
         actor.require("read")
         self._allowed(safe_parts(path))
-        data = self._read_bytes(path)
-        result = {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        data, info = self._read_file(path)
+        modified_at = datetime.fromtimestamp(info.st_mtime_ns // 1_000_000_000, timezone.utc).isoformat(timespec="seconds").removesuffix("+00:00")
+        modified_at += f".{info.st_mtime_ns % 1_000_000_000:09d}Z"
+        result = {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                  "modified_at": modified_at}
         try:
             result["text"] = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -208,8 +263,12 @@ class Vault:
         finally:
             os.close(fd)
 
-    def _cursor(self, operation: str, prefix: str, query: str | None, cursor: str | None):
-        binding = hashlib.sha256(json.dumps([operation, prefix, query, self.denied_paths],
+    def _cursor(self, operation: str, prefix: str, query: str | None, cursor: str | None, window=(None, None)):
+        filters = [str(bound) if bound is not None else None for bound in window]
+        identity = [operation, prefix, query, self.denied_paths]
+        if any(bound is not None for bound in window):
+            identity.append(filters)
+        binding = hashlib.sha256(json.dumps(identity,
                                             ensure_ascii=False).encode()).hexdigest()
         if cursor is None:
             return binding, None
@@ -231,7 +290,8 @@ class Vault:
             raise ValueError("invalid cursor") from None
 
     def _page(self, actor: Principal, operation: str, prefix: str | None, limit: int,
-              cursor: str | None, query: str | None = None) -> dict:
+              cursor: str | None, query: str | None = None,
+              modified_after: str | None = None, modified_before: str | None = None) -> dict:
         actor.require("read")
         max_items = 200 if operation == "list" else 50
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= max_items:
@@ -241,7 +301,9 @@ class Vault:
         selected = self.write_folder if prefix is None else prefix
         if selected != "":
             safe_parts(selected)
-        binding, after = self._cursor(operation, selected, query, cursor)
+        window = _modified_window(modified_after, modified_before)
+        filtered = any(bound is not None for bound in window)
+        binding, after = self._cursor(operation, selected, query, cursor, window)
         items, scanned, skipped = [], 0, 0
         last = after
         paths = self._files(selected, recursive=operation == "search" or selected != "")
@@ -262,6 +324,17 @@ class Vault:
                 if isinstance(relative, tuple):
                     skipped += 1
                     continue
+                if operation == "search" and not relative.lower().endswith(".md"):
+                    continue
+                if filtered:
+                    if relative.endswith("/"):
+                        continue  # A directory mtime does not describe descendant edits.
+                    try:
+                        if not _in_window(self._file_info(relative), window):
+                            continue
+                    except (OSError, ValueError):
+                        skipped += 1
+                        continue
                 if operation == "list":
                     items.append(relative)
                 elif relative.lower().endswith(".md"):
@@ -269,7 +342,10 @@ class Vault:
                         items.append({"path": relative, "match": "filename"})
                     else:
                         try:
-                            lines = self._read_bytes(relative).decode("utf-8", errors="replace").splitlines()
+                            data = self._read_bytes(relative, window=window) if filtered else self._read_bytes(relative)
+                            if data is None:
+                                continue
+                            lines = data.decode("utf-8", errors="replace").splitlines()
                         except (OSError, ValueError):
                             skipped += 1
                             continue
@@ -288,21 +364,25 @@ class Vault:
                 "truncated": True, "next_cursor": encoded}
 
     def list_files_page(self, actor: Principal, prefix: str | None = None, limit: int = 100,
-                        cursor: str | None = None) -> dict:
-        return self._page(actor, "list", prefix, limit, cursor)
+                        cursor: str | None = None, modified_after: str | None = None,
+                        modified_before: str | None = None) -> dict:
+        return self._page(actor, "list", prefix, limit, cursor, modified_after=modified_after, modified_before=modified_before)
 
     def search_notes_page(self, actor: Principal, query: str, prefix: str | None = None,
-                          limit: int = 20, cursor: str | None = None) -> dict:
-        return self._page(actor, "search", prefix, limit, cursor, query)
+                          limit: int = 20, cursor: str | None = None, modified_after: str | None = None,
+                          modified_before: str | None = None) -> dict:
+        return self._page(actor, "search", prefix, limit, cursor, query, modified_after, modified_before)
 
-    def list_files(self, actor: Principal, prefix: str | None = None, limit: int = 100) -> list[str]:
-        page = self.list_files_page(actor, prefix, limit)
+    def list_files(self, actor: Principal, prefix: str | None = None, limit: int = 100,
+                   modified_after: str | None = None, modified_before: str | None = None) -> list[str]:
+        page = self.list_files_page(actor, prefix, limit, modified_after=modified_after, modified_before=modified_before)
         if page["truncated"] or page["skipped"]:
             raise ValueError("list incomplete; use list_files_page and inspect skipped")
         return page["items"]
 
-    def search(self, actor: Principal, query: str, prefix: str | None = None, limit: int = 20) -> list[dict]:
-        page = self.search_notes_page(actor, query, prefix, limit)
+    def search(self, actor: Principal, query: str, prefix: str | None = None, limit: int = 20,
+               modified_after: str | None = None, modified_before: str | None = None) -> list[dict]:
+        page = self.search_notes_page(actor, query, prefix, limit, modified_after=modified_after, modified_before=modified_before)
         if page["truncated"] or page["skipped"]:
             raise ValueError("search incomplete; use search_notes_page and inspect skipped")
         return page["items"]
