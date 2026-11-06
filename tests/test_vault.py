@@ -244,6 +244,28 @@ class VaultFixture(unittest.TestCase):
         self.assertIsNone(next_page["next_cursor"])
         self.assertGreaterEqual(next_page["skipped"], 1)
 
+    def test_later_page_reports_unreadable_ancestor(self):
+        (self.mirror / "Agents" / "sub").mkdir()
+        (self.mirror / "Agents" / "sub" / "marker.md").write_text("first")
+        (self.mirror / "Agents" / "z-marker.md").write_text("later")
+        first = self.vault.search_notes_page(self.reader, "marker", limit=1)
+        self.assertEqual(first["items"][0]["path"], "Agents/sub/marker.md")
+        self.assertIsNotNone(first["next_cursor"])
+        original_open = os.open
+
+        def unreadable_sub(path, *args, **kwargs):
+            if path == "sub":
+                raise PermissionError("fixture unreadable directory")
+            return original_open(path, *args, **kwargs)
+
+        with patch("vault_mcp.vault.os.open", side_effect=unreadable_sub):
+            later = self.vault.search_notes_page(self.reader, "marker", limit=1,
+                                                 cursor=first["next_cursor"])
+        self.assertEqual(later["items"], [{"path": "Agents/z-marker.md", "match": "filename"}])
+        self.assertEqual(later["skipped"], 1)
+        self.assertGreaterEqual(later["scanned"], 2)
+        self.assertIsNone(later["next_cursor"])
+
     def test_ready_gate(self):
         self.ready.write_text(json.dumps({"phase": "ready", "ok": True, "completed_at": time.time() - 1000,
                                           "heartbeat_at": time.time(), "error_code": None}))

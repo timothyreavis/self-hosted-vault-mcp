@@ -41,7 +41,9 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(change=change), patch.dict(os.environ, {**self.env, **change}, clear=True):
                 with self.assertRaises(ValueError):
                     Config.from_env()
-        for value in ("Agents", "agents/Private;AGENTS.md;agents/private", "../escape", "/absolute", "Agents/.hidden"):
+        (self.root / "PolicyLink").symlink_to(self.root / "Agents", target_is_directory=True)
+        for value in ("Agents", "agents/Private;AGENTS.md;agents/private", "../escape", "/absolute",
+                      "Agents/.hidden", "Private; Health", "Private;Health ", "Agents/ Private", "PolicyLink"):
             with self.subTest(denied=value), patch.dict(os.environ, {**self.env, "VAULT_DENIED_PATHS": value}, clear=True):
                 with self.assertRaises(ValueError):
                     Config.from_env()

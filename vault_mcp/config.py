@@ -34,8 +34,8 @@ def validate_paths(root, state, ready, write_folder, instructions, context, deni
             target = root.joinpath(*safe_parts(path))
             if target.resolve() != target or (target.exists() and not target.is_file()):
                 raise ValueError("optional metadata must be a visible file without symlinks")
-    for path in denied:
-        target = root.joinpath(*path)
+    for path in denied_paths:
+        target = root.joinpath(*safe_parts(path))
         if target.resolve() != target:
             raise ValueError("VAULT_DENIED_PATHS cannot contain symlinks")
     if ready is not None and (ready == root or root in ready.parents or ready == state or ready.is_dir()):

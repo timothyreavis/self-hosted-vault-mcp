@@ -63,7 +63,10 @@ def policy_parts(paths) -> tuple[tuple[str, ...], ...]:
         raise ValueError("invalid VAULT_DENIED_PATHS")
     result = []
     for path in paths:
-        parts = _identity(safe_parts(path))
+        raw = safe_parts(path)
+        if any(part != part.strip() for part in raw):
+            raise ValueError("VAULT_DENIED_PATHS must not have surrounding whitespace")
+        parts = _identity(raw)
         if parts in result:
             raise ValueError("duplicate VAULT_DENIED_PATHS")
         result.append(parts)
@@ -246,6 +249,11 @@ class Vault:
             for relative in paths:
                 key = relative[1] if isinstance(relative, tuple) else tuple(relative.rstrip("/").split("/"))
                 if after is not None and key <= after:
+                    if isinstance(relative, tuple) and len(key) < len(after) and after[:len(key)] == key:
+                        if scanned >= SEARCH_LIMIT or len(items) >= limit:
+                            break
+                        scanned += 1
+                        skipped += 1
                     continue
                 if scanned >= SEARCH_LIMIT or len(items) >= limit:
                     break
