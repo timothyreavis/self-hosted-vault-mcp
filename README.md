@@ -21,8 +21,10 @@ Ask your agent to follow [AGENTS.md](AGENTS.md) for detailed configuration and a
 | --- | --- |
 | `bootstrap` | Live owner instructions and optional context, including hashes or missing metadata |
 | `list_files` | Recursive files in the write folder by default; explicit `prefix: ""` lists immediate root entries, with `/` after directory names |
+| `list_files_page` | Preferred discovery; same prefix defaults, up to 200 items per page, with continuation and coverage |
 | `read_file` | One explicit visible file, with SHA-256 (up to 256 KiB) |
-| `search_notes` | Markdown search, defaulting to the write folder; explicit `prefix: ""` searches the vault, bounded to 1,000 candidate notes |
+| `search_notes` | Legacy bounded Markdown search; fails with a page-tool hint when the answer is incomplete |
+| `search_notes_page` | Preferred Markdown search; same prefix defaults, up to 50 matches and 1,000 scanned entries per page |
 | `create_note` | Exclusive atomic creation, including new nested folders |
 | `update_note` | Atomic replacement with an expected SHA-256 precondition |
 | `storage_status` | Local persistence mode or optional external readiness guard |
@@ -33,9 +35,17 @@ Writes require `agent_write`, a portable `.md` path inside the write folder, con
 
 A successful save confirms local filesystem persistence. It does **not** confirm synchronization to another device. Use a separately managed synchronization solution if needed; this project bundles none. Standalone writes work as soon as valid storage and authentication are configured. An optional external-readiness guard is documented in AGENTS.md and fails closed whenever configured.
 
+Before trusting a connected deployment, check that the actual synchronizer ignores `.vault-*.tmp` staging files. With synthetic notes and owner permission, verify MCP save to another device and a reverse edit from that device back through MCP read/SHA. In the intended native client, verify OAuth login, initialize, tool listing, read, and a permitted synthetic create/update. These connected checks are separate from the local fixture suite.
+
 The mutex coordinates MCP writers sharing the state directory. It is not a distributed lock; external editors and synchronizers can race a hash check. Use one MCP instance and avoid concurrent external edits to agent-owned notes. Keep backups of the vault and private state together; the state ledger preserves retry history and contains stored operation receipts.
 
 Hidden paths, traversal, and symlinks are blocked. Visible files elsewhere in the vault can be read explicitly. This is one vault trust boundary, not a per-folder multi-user permission system. Notes are untrusted data; the owner's instructions govern permitted use.
+
+Set `VAULT_DENIED_PATHS` to semicolon-separated visible relative paths, for example `Private;Agents/Archive`, to exclude those paths and descendants from generic reads, bootstrap, discovery, and writes. Matching uses Unicode NFC and casefolded path components, so `Privateer` is unaffected. The empty default keeps prior access. The configured write folder itself cannot be excluded. Restart after changing this setting.
+
+Prefer the page tools for discovery. Their envelope contains `items`, `scanned`, `skipped`, `truncated`, and `next_cursor`. `scanned` counts examined visible entries in this call; `skipped` counts entries that could not be examined or read. A page may have no items and still have a cursor. Follow cursors until `next_cursor` is null and inspect skipped counts before claiming complete content coverage. Cursors bind to the operation, query, prefix and exclusion policy; malformed or mismatched cursors fail. They hold traversal position, not access rights or a snapshot of concurrent vault edits. Legacy `list_files` and `search_notes` retain their inputs and list output shapes when complete, and return an actionable error when bounded results are incomplete.
+
+For existing clients, keep their legacy calls while upgrading them to follow page cursors. Reconnect after the server restarts so the client discovers the new tools. Start a new search after changing the query, prefix, or exclusion setting; an old cursor will be rejected. A completed page traversal proves only what this server could read during that traversal. It does not prove remote synchronization or a stable snapshot while another editor changes files.
 
 ## Development
 

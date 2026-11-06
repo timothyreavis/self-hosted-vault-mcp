@@ -41,6 +41,14 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(change=change), patch.dict(os.environ, {**self.env, **change}, clear=True):
                 with self.assertRaises(ValueError):
                     Config.from_env()
+        (self.root / "PolicyLink").symlink_to(self.root / "Agents", target_is_directory=True)
+        for value in ("Agents", "agents/Private;AGENTS.md;agents/private", "../escape", "/absolute",
+                      "Agents/.hidden", "Private; Health", "Private;Health ", "Agents/ Private", "PolicyLink"):
+            with self.subTest(denied=value), patch.dict(os.environ, {**self.env, "VAULT_DENIED_PATHS": value}, clear=True):
+                with self.assertRaises(ValueError):
+                    Config.from_env()
+        with patch.dict(os.environ, {**self.env, "VAULT_DENIED_PATHS": "Agents/Private;Reference"}, clear=True):
+            self.assertEqual(Config.from_env().denied_paths, ("Agents/Private", "Reference"))
         for change in ({"CF_ACCESS_TEAM": "https://wrong.invalid"}, {"CF_ACCESS_TEAM": "fixture/path"},
                        {"VAULT_ALLOWED_USERS": "anyone"}, {"VAULT_ALLOWED_USERS": "user@example.invalid=admin"},
                        {"VAULT_ALLOWED_SERVICES": "bot=read;bot=agent_write"},

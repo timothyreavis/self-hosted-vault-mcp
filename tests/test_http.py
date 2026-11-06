@@ -74,7 +74,7 @@ class HTTPFixture(unittest.TestCase):
             self.assertEqual(initialized.json()["result"]["serverInfo"]["name"], "Self-hosted Vault MCP")
             self.assertNotIn("mcp-session-id", initialized.headers)
             listed = self.post(client, "tools/list", assertion=self.assertion()).json()["result"]["tools"]
-            self.assertEqual({t["name"] for t in listed}, {"bootstrap", "list_files", "read_file", "search_notes",
+            self.assertEqual({t["name"] for t in listed}, {"bootstrap", "list_files", "list_files_page", "read_file", "search_notes", "search_notes_page",
                                                                "create_note", "update_note", "storage_status"})
             self.assertEqual(self.data(self.call(client, "bootstrap"))["instructions"]["text"], "fixture rules")
             self.assertEqual(self.data(self.call(client, "storage_status"))["mode"], "local")
@@ -145,9 +145,11 @@ class HTTPFixture(unittest.TestCase):
         (self.root / ".hidden").mkdir()
         (self.root / "alias").symlink_to(self.root / "Reference", target_is_directory=True)
         with TestClient(self.app) as client:
-            defaults = self.data(self.call(client, "list_files"))
-            self.assertEqual(len(defaults), 100)
-            self.assertTrue(all(path.startswith("Agents/") for path in defaults))
+            defaults = self.data(self.call(client, "list_files_page"))
+            self.assertEqual(len(defaults["items"]), 100)
+            self.assertTrue(defaults["truncated"])
+            self.assertTrue(all(path.startswith("Agents/") for path in defaults["items"]))
+            self.assertTrue(self.call(client, "list_files")["isError"])
             entries = self.data(self.call(client, "list_files", {"prefix": ""}))
             self.assertEqual(entries, ["AGENTS.md", "Agents/", "Reference/"])
             self.assertEqual(self.data(self.call(client, "search_notes", {"query": "reference fixture", "prefix": ""}))[0]["path"], "Reference/sample.md")
@@ -159,3 +161,19 @@ class HTTPFixture(unittest.TestCase):
                 result = self.call(client, tool, arguments)
                 self.assertTrue(result["isError"])
                 self.assertEqual(result["content"], [{"type": "text", "text": "not found"}])
+
+    def test_transport_policy_and_page_coverage(self):
+        (self.root / "Agents" / "Private").mkdir()
+        (self.root / "Agents" / "Private" / "secret.md").write_text("private marker")
+        app = create_app(Config(self.root, Path(self.tmp.name) / "policy-state",
+                                denied_paths=("Agents/Private", "AGENTS.md")), self.verifier)
+        with TestClient(app) as client:
+            for name, args in (("read_file", {"path": "Agents/Private/secret.md"}),
+                               ("bootstrap", {}), ("list_files_page", {"prefix": "Agents/private"}),
+                               ("search_notes_page", {"query": "private", "prefix": "Agents/Private"}),
+                               ("create_note", {"path": "Agents/Private/new.md", "content": "x", "request_id": str(uuid.uuid4())})):
+                self.assertTrue(self.call(client, name, args)["isError"], name)
+            page = self.data(self.call(client, "list_files_page", {"prefix": "Agents"}))
+            self.assertNotIn("Agents/Private/secret.md", page["items"])
+            self.assertEqual(self.data(self.call(client, "search_notes_page", {"query": "private marker"}))["items"], [])
+            self.assertFalse((self.root / "Agents/Private/new.md").exists())

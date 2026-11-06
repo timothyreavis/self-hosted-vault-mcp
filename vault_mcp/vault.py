@@ -1,5 +1,6 @@
 """Single vault path and permission kernel. All caller adapters use this class."""
 import fcntl
+import base64
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ WINDOWS_RESERVED = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³
 READ_LIMIT = 256 * 1024
 NOTE_LIMIT = 64 * 1024
 SEARCH_LIMIT = 1000
+CURSOR_LIMIT = 4096
 
 
 class PrePublishError(RuntimeError):
@@ -52,14 +54,36 @@ def write_parts(path: str) -> tuple[str, ...]:
     return parts
 
 
+def _identity(parts: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(unicodedata.normalize("NFC", part).casefold() for part in parts)
+
+
+def policy_parts(paths) -> tuple[tuple[str, ...], ...]:
+    if not isinstance(paths, (tuple, list)):
+        raise ValueError("invalid VAULT_DENIED_PATHS")
+    result = []
+    for path in paths:
+        raw = safe_parts(path)
+        if any(part != part.strip() for part in raw):
+            raise ValueError("VAULT_DENIED_PATHS must not have surrounding whitespace")
+        parts = _identity(raw)
+        if parts in result:
+            raise ValueError("duplicate VAULT_DENIED_PATHS")
+        result.append(parts)
+    return tuple(result)
+
+
 class Vault:
+    denied_paths: tuple[tuple[str, ...], ...] = ()  # Legacy object.__new__ read views default to empty policy.
     def __init__(self, root: Path, state: Path, ready: Path | None = None,
-                 write_folder: str = "Agents", instructions: str = "AGENTS.md", context: str | None = None):
+                 write_folder: str = "Agents", instructions: str = "AGENTS.md", context: str | None = None,
+                 denied_paths: tuple[str, ...] = ()):
         from .config import validate_paths
-        validate_paths(root, state, ready, write_folder, instructions, context)
+        validate_paths(root, state, ready, write_folder, instructions, context, denied_paths)
         self.root, self.state, self.ready = root, state, ready
         self.write_folder, self.instructions, self.context = write_folder, instructions, context
         self.write_root = write_parts(write_folder)
+        self.denied_paths = policy_parts(denied_paths)
         self.lock = state / "operations.lock"
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
         with sqlite3.connect(state / "operations.sqlite3") as db:
@@ -108,13 +132,20 @@ class Vault:
 
     def _writable(self, path: str) -> None:
         parts = write_parts(path)
+        self._allowed(parts)
         if parts[:len(self.write_root)] != self.write_root or len(parts) <= len(self.write_root):
             raise PermissionError("write outside configured folder")
         if not path.endswith(".md"):
             raise ValueError("notes must use .md extension")
 
+    def _allowed(self, parts: tuple[str, ...]) -> None:
+        identity = _identity(parts)
+        if any(identity[:len(denied)] == denied for denied in self.denied_paths):
+            raise PermissionError("path excluded by vault policy")
+
     def read(self, actor: Principal, path: str) -> dict:
         actor.require("read")
+        self._allowed(safe_parts(path))
         data = self._read_bytes(path)
         result = {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         try:
@@ -138,23 +169,37 @@ class Vault:
 
     def _files(self, prefix: str, recursive: bool = True):
         parts = () if prefix == "" else safe_parts(prefix)
+        self._allowed(parts)
         def walk(fd, parents):
-            for name in sorted(os.listdir(fd)):
+            try:
+                names = sorted(os.listdir(fd))
+            except OSError:
+                yield (None, parents)
+                return
+            for name in names:
                 if name.startswith("."):
                     continue
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                child_parts = (*parents, name)
+                if any(_identity(child_parts)[:len(denied)] == denied for denied in self.denied_paths):
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    yield (None, child_parts)
+                    continue
                 if stat.S_ISREG(info.st_mode):
-                    yield "/".join((*parents, name))
+                    yield "/".join(child_parts)
                 elif stat.S_ISDIR(info.st_mode):
                     if not recursive:
-                        yield "/".join((*parents, name)) + "/"
+                        yield "/".join(child_parts) + "/"
                         continue
                     try:
                         child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     except OSError:
+                        yield (None, child_parts)
                         continue
                     try:
-                        yield from walk(child, (*parents, name))
+                        yield from walk(child, child_parts)
                     finally:
                         os.close(child)
         fd = self._directory(parts)
@@ -163,36 +208,104 @@ class Vault:
         finally:
             os.close(fd)
 
-    def list_files(self, actor: Principal, prefix: str | None = None, limit: int = 100) -> list[str]:
+    def _cursor(self, operation: str, prefix: str, query: str | None, cursor: str | None):
+        binding = hashlib.sha256(json.dumps([operation, prefix, query, self.denied_paths],
+                                            ensure_ascii=False).encode()).hexdigest()
+        if cursor is None:
+            return binding, None
+        if (not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_LIMIT
+                or not re.fullmatch(r"[A-Za-z0-9_-]+", cursor)):
+            raise ValueError("invalid cursor")
+        try:
+            raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+            value = json.loads(raw)
+            after = value["after"]
+            if (value["v"] != 1 or value["binding"] != binding or not isinstance(after, list)
+                    or not after or any(not isinstance(part, str) or not part for part in after)
+                    or set(value) != {"v", "binding", "after"}):
+                raise ValueError
+            # Cursors are positions only; path policy remains enforced by the current traversal.
+            safe_parts("/".join(after))
+            return binding, tuple(after)
+        except (ValueError, KeyError, TypeError, UnicodeError, base64.binascii.Error):
+            raise ValueError("invalid cursor") from None
+
+    def _page(self, actor: Principal, operation: str, prefix: str | None, limit: int,
+              cursor: str | None, query: str | None = None) -> dict:
         actor.require("read")
-        if not 1 <= limit <= 200:
+        max_items = 200 if operation == "list" else 50
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= max_items:
             raise ValueError("invalid limit")
-        from itertools import islice
-        return list(islice(self._files(self.write_folder if prefix is None else prefix, recursive=prefix != ""), limit))
+        if operation == "search" and (not isinstance(query, str) or not query or len(query) > 200):
+            raise ValueError("invalid search")
+        selected = self.write_folder if prefix is None else prefix
+        if selected != "":
+            safe_parts(selected)
+        binding, after = self._cursor(operation, selected, query, cursor)
+        items, scanned, skipped = [], 0, 0
+        last = after
+        paths = self._files(selected, recursive=operation == "search" or selected != "")
+        try:
+            for relative in paths:
+                key = relative[1] if isinstance(relative, tuple) else tuple(relative.rstrip("/").split("/"))
+                if after is not None and key <= after:
+                    if isinstance(relative, tuple) and len(key) < len(after) and after[:len(key)] == key:
+                        if scanned >= SEARCH_LIMIT or len(items) >= limit:
+                            break
+                        scanned += 1
+                        skipped += 1
+                    continue
+                if scanned >= SEARCH_LIMIT or len(items) >= limit:
+                    break
+                scanned += 1
+                last = key
+                if isinstance(relative, tuple):
+                    skipped += 1
+                    continue
+                if operation == "list":
+                    items.append(relative)
+                elif relative.lower().endswith(".md"):
+                    if query.casefold() in relative.casefold():
+                        items.append({"path": relative, "match": "filename"})
+                    else:
+                        try:
+                            lines = self._read_bytes(relative).decode("utf-8", errors="replace").splitlines()
+                        except (OSError, ValueError):
+                            skipped += 1
+                            continue
+                        for number, line in enumerate(lines, 1):
+                            if query.casefold() in line.casefold():
+                                items.append({"path": relative, "line": number, "excerpt": line.strip()[:240]})
+                                break
+            else:
+                return {"items": items, "scanned": scanned, "skipped": skipped,
+                        "truncated": False, "next_cursor": None}
+        finally:
+            paths.close()
+        encoded = base64.urlsafe_b64encode(json.dumps({"v": 1, "binding": binding, "after": last},
+                                                     separators=(",", ":")).encode()).decode().rstrip("=")
+        return {"items": items, "scanned": scanned, "skipped": skipped,
+                "truncated": True, "next_cursor": encoded}
+
+    def list_files_page(self, actor: Principal, prefix: str | None = None, limit: int = 100,
+                        cursor: str | None = None) -> dict:
+        return self._page(actor, "list", prefix, limit, cursor)
+
+    def search_notes_page(self, actor: Principal, query: str, prefix: str | None = None,
+                          limit: int = 20, cursor: str | None = None) -> dict:
+        return self._page(actor, "search", prefix, limit, cursor, query)
+
+    def list_files(self, actor: Principal, prefix: str | None = None, limit: int = 100) -> list[str]:
+        page = self.list_files_page(actor, prefix, limit)
+        if page["truncated"] or page["skipped"]:
+            raise ValueError("list incomplete; use list_files_page and inspect skipped")
+        return page["items"]
 
     def search(self, actor: Principal, query: str, prefix: str | None = None, limit: int = 20) -> list[dict]:
-        actor.require("read")
-        if not query or len(query) > 200 or not 1 <= limit <= 50:
-            raise ValueError("invalid search")
-        matches = []
-        from itertools import islice
-        paths = (path for path in self._files(self.write_folder if prefix is None else prefix)
-                 if path.lower().endswith(".md"))
-        for relative in islice(paths, SEARCH_LIMIT):
-            if query.casefold() in relative.casefold():
-                matches.append({"path": relative, "match": "filename"})
-            else:
-                try:
-                    lines = self._read_bytes(relative).decode("utf-8", errors="replace").splitlines()
-                except (OSError, ValueError):
-                    continue
-                for number, line in enumerate(lines, 1):
-                    if query.casefold() in line.casefold():
-                        matches.append({"path": relative, "line": number, "excerpt": line.strip()[:240]})
-                        break
-            if len(matches) >= limit:
-                break
-        return matches
+        page = self.search_notes_page(actor, query, prefix, limit)
+        if page["truncated"] or page["skipped"]:
+            raise ValueError("search incomplete; use search_notes_page and inspect skipped")
+        return page["items"]
 
     def storage_status(self, actor: Principal) -> dict:
         actor.require("read")
@@ -329,6 +442,7 @@ class Vault:
 
     def create_note(self, actor: Principal, path: str, content: str, request_id: str) -> dict:
         actor.require("agent_write")
+        self._allowed(write_parts(path))
         self._writable(path)
         write_parts(path)
         fingerprint = hashlib.sha256(f"create\0{path}\0{content}".encode()).hexdigest()
@@ -336,6 +450,7 @@ class Vault:
 
     def update_note(self, actor: Principal, path: str, content: str, expected_sha: str, request_id: str) -> dict:
         actor.require("agent_write")
+        self._allowed(write_parts(path))
         self._writable(path)
         write_parts(path)
         fingerprint = hashlib.sha256(f"update\0{path}\0{expected_sha}\0{content}".encode()).hexdigest()

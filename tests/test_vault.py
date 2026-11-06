@@ -132,6 +132,140 @@ class VaultFixture(unittest.TestCase):
         self.assertEqual(self.vault.search(self.reader, "outside target marker", "Projects")[0]["path"], "Projects/target.md")
         self.assertEqual(self.vault.search(self.reader, "reference marker", "Reference")[0]["path"], "Reference/sample.md")
 
+    def test_denied_paths_cover_direct_discovery_and_writes(self):
+        private = self.mirror / "Agents" / "Private"
+        private.mkdir()
+        (private / "secret.md").write_text("secret marker")
+        (self.mirror / "Agents" / "Privateer.md").write_text("visible marker")
+        denied = Vault(self.mirror, Path(self.tmp.name) / "denied-state", denied_paths=("Agents/Private", "AGENTS.md"))
+        with self.assertRaises(PermissionError):
+            denied.read(self.reader, "Agents/PRIVATE/secret.md")
+        with self.assertRaises(PermissionError):
+            denied.bootstrap(self.reader)
+        with self.assertRaises(PermissionError):
+            denied.list_files_page(self.reader, "Agents/Private")
+        with self.assertRaises(PermissionError):
+            denied.search_notes_page(self.reader, "secret", "Agents/private")
+        paths = denied.list_files_page(self.reader, "Agents")["items"]
+        self.assertNotIn("Agents/Private/secret.md", paths)
+        self.assertIn("Agents/Privateer.md", paths)
+        with patch.object(denied, "_read_bytes", wraps=denied._read_bytes) as read_bytes:
+            self.assertEqual(denied.search_notes_page(self.reader, "secret")["items"], [])
+            self.assertNotIn("Agents/Private/secret.md", [call.args[0] for call in read_bytes.call_args_list])
+        self.assertNotIn("Agents/Private/", denied.list_files_page(self.reader, "")["items"])
+        request = str(uuid.uuid4())
+        with self.assertRaises(PermissionError):
+            denied.create_note(self.writer, "Agents/private/new.md", "body", request)
+        with self.assertRaises(PermissionError):
+            denied.update_note(self.writer, "Agents/Private/secret.md", "edit", "0" * 64, request)
+        with sqlite3.connect(denied.state / "operations.sqlite3") as db:
+            self.assertIsNone(db.execute("SELECT id FROM operations WHERE id=?", (request,)).fetchone())
+        (self.mirror / "Agents" / "Cafe\u0301").mkdir()
+        (self.mirror / "Agents" / "Cafe\u0301" / "x.md").write_text("unicode secret")
+        unicode_denied = Vault(self.mirror, Path(self.tmp.name) / "unicode-state", denied_paths=("Agents/Caf\u00e9",))
+        with self.assertRaises(PermissionError):
+            unicode_denied.read(self.reader, "Agents/Cafe\u0301/x.md")
+        self.assertNotIn("Agents/Cafe\u0301/x.md", unicode_denied.list_files_page(self.reader)["items"])
+
+    def test_generic_policy_survives_private_writable_override(self):
+        (self.mirror / "Agents" / "Private").mkdir()
+        (self.mirror / "Agents" / "Private" / "existing.md").write_text("fixed adapter body")
+
+        class PermissiveView(Vault):
+            def _writable(self, path):
+                pass
+
+        view = PermissiveView(self.mirror, Path(self.tmp.name) / "override-state",
+                              denied_paths=("Agents/Private",))
+        self.assertEqual(view._read_bytes("Agents/Private/existing.md"), b"fixed adapter body")
+        with self.assertRaises(PermissionError):
+            view.read(self.reader, "Agents/Private/existing.md")
+        for operation in ("create", "update"):
+            request = str(uuid.uuid4())
+            with self.subTest(operation=operation), self.assertRaises(PermissionError):
+                if operation == "create":
+                    view.create_note(self.writer, "Agents/Private/new.md", "body", request)
+                else:
+                    view.update_note(self.writer, "Agents/Private/existing.md", "edit", "0" * 64, request)
+            with sqlite3.connect(view.state / "operations.sqlite3") as db:
+                self.assertIsNone(db.execute("SELECT id FROM operations WHERE id=?", (request,)).fetchone())
+        self.assertFalse((self.mirror / "Agents/Private/new.md").exists())
+        self.assertEqual((self.mirror / "Agents/Private/existing.md").read_text(), "fixed adapter body")
+
+    def test_pages_reach_late_matches_and_reject_wrong_cursor(self):
+        for number in range(1105):
+            (self.mirror / "Agents" / f"note-{number:04}.md").write_text("late target" if number == 1104 else "ordinary")
+        with self.assertRaisesRegex(ValueError, "search_notes_page"):
+            self.vault.search(self.reader, "late target")
+        cursor = None
+        seen = []
+        scanned = 0
+        for _ in range(4):
+            page = self.vault.search_notes_page(self.reader, "late target", limit=2, cursor=cursor)
+            scanned += page["scanned"]
+            seen.extend(page["items"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(seen, [{"path": "Agents/note-1104.md", "line": 1, "excerpt": "late target"}])
+        self.assertGreater(scanned, 1000)
+        first = self.vault.list_files_page(self.reader, limit=200)
+        self.assertTrue(first["truncated"])
+        listed = first["items"][:]
+        next_cursor = first["next_cursor"]
+        while next_cursor is not None:
+            current = self.vault.list_files_page(self.reader, limit=200, cursor=next_cursor)
+            listed.extend(current["items"])
+            next_cursor = current["next_cursor"]
+        self.assertEqual(len(listed), 1106)
+        self.assertEqual(len(set(listed)), len(listed))
+        with self.assertRaisesRegex(ValueError, "list_files_page"):
+            self.vault.list_files(self.reader, limit=200)
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            self.vault.list_files_page(self.reader, "Reference", cursor=first["next_cursor"])
+        changed_policy = Vault(self.mirror, Path(self.tmp.name) / "changed-state", denied_paths=("Reference",))
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            changed_policy.list_files_page(self.reader, cursor=first["next_cursor"])
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            self.vault.search_notes_page(self.reader, "other", cursor=cursor or first["next_cursor"])
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            self.vault.list_files_page(self.reader, cursor="broken")
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            self.vault.list_files_page(self.reader, cursor=first["next_cursor"] + "!")
+
+    def test_empty_search_continuation_and_skipped_large_content(self):
+        for number in range(1010):
+            (self.mirror / "Agents" / f"file-{number:04}.md").write_text("ordinary")
+        (self.mirror / "Agents" / "file-1009.md").write_text("x" * (256 * 1024 + 1))
+        page = self.vault.search_notes_page(self.reader, "unseen")
+        self.assertEqual(page["items"], [])
+        self.assertTrue(page["truncated"])
+        next_page = self.vault.search_notes_page(self.reader, "unseen", cursor=page["next_cursor"])
+        self.assertIsNone(next_page["next_cursor"])
+        self.assertGreaterEqual(next_page["skipped"], 1)
+
+    def test_later_page_reports_unreadable_ancestor(self):
+        (self.mirror / "Agents" / "sub").mkdir()
+        (self.mirror / "Agents" / "sub" / "marker.md").write_text("first")
+        (self.mirror / "Agents" / "z-marker.md").write_text("later")
+        first = self.vault.search_notes_page(self.reader, "marker", limit=1)
+        self.assertEqual(first["items"][0]["path"], "Agents/sub/marker.md")
+        self.assertIsNotNone(first["next_cursor"])
+        original_open = os.open
+
+        def unreadable_sub(path, *args, **kwargs):
+            if path == "sub":
+                raise PermissionError("fixture unreadable directory")
+            return original_open(path, *args, **kwargs)
+
+        with patch("vault_mcp.vault.os.open", side_effect=unreadable_sub):
+            later = self.vault.search_notes_page(self.reader, "marker", limit=1,
+                                                 cursor=first["next_cursor"])
+        self.assertEqual(later["items"], [{"path": "Agents/z-marker.md", "match": "filename"}])
+        self.assertEqual(later["skipped"], 1)
+        self.assertGreaterEqual(later["scanned"], 2)
+        self.assertIsNone(later["next_cursor"])
+
     def test_ready_gate(self):
         self.ready.write_text(json.dumps({"phase": "ready", "ok": True, "completed_at": time.time() - 1000,
                                           "heartbeat_at": time.time(), "error_code": None}))
