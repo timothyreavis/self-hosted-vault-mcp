@@ -33,30 +33,34 @@ def create_app(config: Config | None = None, verifier=None):
         return _call(vault.bootstrap)
 
     @mcp.tool
-    def list_files(prefix: str | None = None, limit: int = 100) -> list[str]:
-        """List recursively in the write folder by default; explicit empty prefix lists root entries (dirs end /)."""
-        return _call(vault.list_files, prefix, limit)
+    def list_files(prefix: str | None = None, limit: int = 100,
+                   modified_after: str | None = None, modified_before: str | None = None) -> list[str]:
+        """List recursively in the write folder by default; empty prefix lists root entries. Optional aware RFC3339 mtime window is [after, before)."""
+        return _call(vault.list_files, prefix, limit, modified_after, modified_before)
 
     @mcp.tool
-    def list_files_page(prefix: str | None = None, limit: int = 100, cursor: str | None = None) -> dict:
-        """List with bounded continuation and explicit scan coverage; prefer this over list_files."""
-        return _call(vault.list_files_page, prefix, limit, cursor)
+    def list_files_page(prefix: str | None = None, limit: int = 100, cursor: str | None = None,
+                        modified_after: str | None = None, modified_before: str | None = None) -> dict:
+        """List with bounded continuation and explicit scan coverage; optional aware RFC3339 mtime window [after, before)."""
+        return _call(vault.list_files_page, prefix, limit, cursor, modified_after, modified_before)
 
     @mcp.tool
     def read_file(path: str) -> dict:
-        """Read one visible file with SHA-256, bounded to 256 KiB."""
+        """Read one visible file with SHA-256 and UTC modified_at, bounded to 256 KiB."""
         return _call(vault.read, path)
 
     @mcp.tool
-    def search_notes(query: str, prefix: str | None = None, limit: int = 20) -> list[dict]:
-        """Search bounded Markdown content; default write folder, explicit empty prefix searches the vault."""
-        return _call(vault.search, query, prefix, limit)
+    def search_notes(query: str, prefix: str | None = None, limit: int = 20,
+                     modified_after: str | None = None, modified_before: str | None = None) -> list[dict]:
+        """Search bounded Markdown content; default write folder, empty prefix searches the vault. Optional aware RFC3339 mtime window is [after, before)."""
+        return _call(vault.search, query, prefix, limit, modified_after, modified_before)
 
     @mcp.tool
     def search_notes_page(query: str, prefix: str | None = None, limit: int = 20,
-                          cursor: str | None = None) -> dict:
-        """Search with bounded continuation and explicit scan coverage; prefer this over search_notes."""
-        return _call(vault.search_notes_page, query, prefix, limit, cursor)
+                          cursor: str | None = None, modified_after: str | None = None,
+                          modified_before: str | None = None) -> dict:
+        """Search with bounded continuation and explicit scan coverage; optional aware RFC3339 mtime window [after, before)."""
+        return _call(vault.search_notes_page, query, prefix, limit, cursor, modified_after, modified_before)
 
     @mcp.tool
     def create_note(path: str, content: str, request_id: str) -> dict:

@@ -45,6 +45,16 @@ Set `VAULT_DENIED_PATHS` to semicolon-separated visible relative paths, for exam
 
 Prefer the page tools for discovery. Their envelope contains `items`, `scanned`, `skipped`, `truncated`, and `next_cursor`. `scanned` counts examined visible entries in this call; `skipped` counts entries that could not be examined or read. A page may have no items and still have a cursor. Follow cursors until `next_cursor` is null and inspect skipped counts before claiming complete content coverage. Cursors bind to the operation, query, prefix and exclusion policy; malformed or mismatched cursors fail. They hold traversal position, not access rights or a snapshot of concurrent vault edits. Legacy `list_files` and `search_notes` retain their inputs and list output shapes when complete, and return an actionable error when bounded results are incomplete.
 
+All four list/search tools accept optional `modified_after` and `modified_before` timezone-aware RFC3339 bounds. The window is **[after, before)**: the lower edge is inclusive and the upper edge exclusive. Either bound may be omitted; malformed/naive timestamps or equal/reversed bounds fail with static errors. For example:
+
+```json
+{"prefix":"Agents","modified_after":"2026-01-01T00:00:00Z","modified_before":"2026-01-02T00:00:00Z"}
+```
+
+Pass these arguments to `list_files_page`; add `query` for `search_notes_page`. Continue with the same window, prefix and query plus `cursor`. Equivalent timezone offsets and fractional spellings share a cursor binding; changing the window fails. Filtering happens before filename/content matching without reading out-of-window bodies. Listing items remain path strings. With filters, `prefix: ""` lists only immediate root files in the window, omitting directories: directory modification times do not describe descendant edits. Use a targeted folder to list its files recursively, or explicit empty-prefix search to search recursively across the visible vault. Omitted filters preserve existing defaults, ordering, limits and coverage rules.
+
+`read_file` also returns `modified_at` as UTC RFC3339, using metadata from the same open file descriptor as the content. Windows use the current filesystem modification time, including newly created notes; this is not original creation time or revision history. Delayed offline edits appear according to the served file's mtime, restored/preserved mtimes may fall outside a recent window, later edits replace earlier timestamps, and deleted files cannot be retrieved. Cursors are not snapshots; inspect `skipped` and repeat bounded discovery as needed during concurrent edits.
+
 For existing clients, keep their legacy calls while upgrading them to follow page cursors. Reconnect after the server restarts so the client discovers the new tools. Start a new search after changing the query, prefix, or exclusion setting; an old cursor will be rejected. A completed page traversal proves only what this server could read during that traversal. It does not prove remote synchronization or a stable snapshot while another editor changes files.
 
 ## Development
