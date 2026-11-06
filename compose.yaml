@@ -1,0 +1,63 @@
+services:
+  mcp:
+    build: .
+    restart: unless-stopped
+    user: "${VAULT_UID:-10001}:${VAULT_GID:-10001}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 384m
+    cpus: 0.5
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    environment:
+      VAULT_ROOT: /vault
+      VAULT_STATE: /state
+      VAULT_WRITE_FOLDER: ${VAULT_WRITE_FOLDER:-Agents}
+      VAULT_INSTRUCTIONS_PATH: ${VAULT_INSTRUCTIONS_PATH:-AGENTS.md}
+      CF_ACCESS_TEAM: ${CF_ACCESS_TEAM:?set Cloudflare team label}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:?set Access application AUD}
+      VAULT_ALLOWED_USERS: ${VAULT_ALLOWED_USERS:-}
+      VAULT_ALLOWED_SERVICES: ${VAULT_ALLOWED_SERVICES:-}
+    volumes:
+      - type: bind
+        source: ${VAULT_HOST_PATH:?set existing vault directory}
+        target: /vault
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${VAULT_HOST_PATH}/${VAULT_WRITE_FOLDER:-Agents}
+        target: /vault/${VAULT_WRITE_FOLDER:-Agents}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${VAULT_STATE_PATH:?set private state directory}
+        target: /state
+        bind:
+          create_host_path: false
+    networks: [origin, egress]
+  cloudflared:
+    image: ${CLOUDFLARED_IMAGE:?set cloudflared image version or digest}
+    command: [tunnel, --no-autoupdate, run, --token-file, /run/secrets/tunnel_token]
+    restart: unless-stopped
+    user: "${VAULT_UID:-10001}:${VAULT_GID:-10001}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.25
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    environment:
+      HOME: /tmp
+    secrets: [tunnel_token]
+    networks: [origin, egress]
+    depends_on: [mcp]
+secrets:
+  tunnel_token:
+    file: ${TUNNEL_TOKEN_FILE:?set private tunnel token file}
+networks:
+  origin:
+    internal: true
+  egress: {}

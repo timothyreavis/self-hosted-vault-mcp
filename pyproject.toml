@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "self-hosted-vault-mcp"
+version = "0.1.0"
+description = "Authenticated MCP tools for a server-side Markdown vault"
+requires-python = ">=3.12"
+license = "LicenseRef-PolyForm-Perimeter-1.0.1"
+license-files = ["LICENSE", "NOTICE"]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.in"]}
+
+[tool.setuptools.packages.find]
+include = ["vault_mcp*"]

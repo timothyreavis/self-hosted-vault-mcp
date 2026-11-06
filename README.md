@@ -1,0 +1,51 @@
+# Self-hosted Vault MCP
+
+Give an MCP client access to a Markdown or Obsidian folder on your server. Read relevant files, search a selected subtree, and create or update notes in one configured folder (default `Agents`). No running Obsidian app or synchronization plugin is needed.
+
+Cloudflare Access authenticates every request. The server verifies signed Access assertions and uses stateless Streamable HTTP at `/mcp`.
+
+## Quick start
+
+You need a Linux server with Docker Engine and Docker Compose v2, an existing vault folder, and a Cloudflare account with a domain, Tunnel, and Access. The image uses Python 3.12. A direct Python installation needs Python 3.12+ with venv/pip and the dependencies in `requirements.txt`.
+
+1. Download this source and copy `.env.example` to `.env`. Set the vault, state, and write-folder paths. Follow the concrete [storage permission instructions](AGENTS.md#storage-permissions) to match the vault owner's numeric UID/GID, or use a dedicated service identity and shared group. The defaults are nonroot `10001:10001`; do not recursively change your vault's ownership.
+2. Follow the ordered [Cloudflare setup](AGENTS.md#cloudflare-and-client-setup): create the tunnel route, protect the entire hostname with Access, configure Managed OAuth (or a bot's Service Auth policy), and save the tunnel token through your password manager into its private file. Fill the corresponding `.env` settings and choose a published cloudflared image version, pinned to its digest for production.
+3. Run `docker compose up -d --build`. Compose publishes no origin host port.
+4. Connect your Streamable HTTP MCP client to `https://vault.example.com/mcp`, complete Access login, and call `bootstrap`.
+
+Ask your agent to follow [AGENTS.md](AGENTS.md) for detailed configuration and a synthetic-note verification. Missing `AGENTS.md` or optional context in the served vault is reported honestly; the server invents no owner rules.
+
+## Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `bootstrap` | Live owner instructions and optional context, including hashes or missing metadata |
+| `list_files` | Recursive files in the write folder by default; explicit `prefix: ""` lists immediate root entries, with `/` after directory names |
+| `read_file` | One explicit visible file, with SHA-256 (up to 256 KiB) |
+| `search_notes` | Markdown search, defaulting to the write folder; explicit `prefix: ""` searches the vault, bounded to 1,000 candidate notes |
+| `create_note` | Exclusive atomic creation, including new nested folders |
+| `update_note` | Atomic replacement with an expected SHA-256 precondition |
+| `storage_status` | Local persistence mode or optional external readiness guard |
+
+Writes require `agent_write`, a portable `.md` path inside the write folder, content no larger than 64 KiB, and a canonical UUID `request_id`. Use the same UUID and payload on retry. Hash conflicts do not overwrite the file. A crash after possible publication leaves an ambiguous ledger entry: inspect the actual file before deciding what to do. Do not bypass ambiguity with a fresh UUID blindly.
+
+## Storage and limits
+
+A successful save confirms local filesystem persistence. It does **not** confirm synchronization to another device. Use a separately managed synchronization solution if needed; this project bundles none. Standalone writes work as soon as valid storage and authentication are configured. An optional external-readiness guard is documented in AGENTS.md and fails closed whenever configured.
+
+The mutex coordinates MCP writers sharing the state directory. It is not a distributed lock; external editors and synchronizers can race a hash check. Use one MCP instance and avoid concurrent external edits to agent-owned notes. Keep backups of the vault and private state together; the state ledger preserves retry history and contains stored operation receipts.
+
+Hidden paths, traversal, and symlinks are blocked. Visible files elsewhere in the vault can be read explicitly. This is one vault trust boundary, not a per-folder multi-user permission system. Notes are untrusted data; the owner's instructions govern permitted use.
+
+## Development
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install --index-url https://pypi.org/simple --require-hashes -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
+```
+
+The tests use synthetic temporary files and locally signed assertions through the real ASGI/MCP transport, with a fixture signing key resolver. They do not establish real Cloudflare configuration or native-client compatibility. CI also builds the container. Follow the deployment verification in AGENTS.md for your actual environment.
+
+Source-available under [PolyForm Perimeter 1.0.1](LICENSE). Personal and internal business use are allowed; providing competing products or services is restricted, including free competing offerings. Exceptions for competing commercial or free offerings require separate permission from the copyright owner. See [NOTICE](NOTICE). Runtime dependencies FastMCP, PyJWT with cryptography, and Uvicorn retain their respective upstream licenses; cloudflared is a separate container maintained by Cloudflare.
